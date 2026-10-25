@@ -410,7 +410,7 @@ def generate_source(model, header_filename: str) -> str:
         ])
         # Stage all fields in a temporary struct first, so no partial update occurs.
         temp_name = "decoded"
-        lines.append(f"    {item['struct_type']} {temp_name} = {{0}};")
+        lines.append(f"    {item['struct_type']} {temp_name} = {{}};")
         for field in item["fields"]:
             signal = field["signal"]
             field_name = field["field_name"]
