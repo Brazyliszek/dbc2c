@@ -5,7 +5,10 @@ Dependency: python -m pip install cantools
 """
 from __future__ import annotations
 
+import ast
+import json
 import re
+import warnings
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -48,10 +51,24 @@ def camel_case(value: str) -> str:
 
 
 def enum_prefix(signal_name: str) -> str:
-    words = [w for w in re.split(r"[^A-Za-z0-9]+", signal_name) if w]
+    words = snake_case(signal_name).split("_")
+    words = [word for word in words if word]
     if not words:
         raise GenerationError(f"Nie można utworzyć przedrostka enumu z {signal_name!r}.")
-    return "".join(w[0] for w in words).upper() + "_"
+    exceptions = {"error": "ERR", "warning": "WARN"}
+    parts = []
+    initials = ""
+    for word in words:
+        if word in exceptions:
+            if initials:
+                parts.append(initials)
+                initials = ""
+            parts.append(exceptions[word])
+        else:
+            initials += word[0].upper()
+    if initials:
+        parts.append(initials)
+    return "_".join(parts) + "_"
 
 
 def c_comment(value: str) -> str:
@@ -168,27 +185,85 @@ def choose_c_type(signal, choices, message_name: str) -> str:
 
 
 def make_comment(signal, description: str) -> str:
-    parts = []
+    metadata = {}
     unit = (getattr(signal, "unit", None) or "").strip()
     minimum = getattr(signal, "minimum", None)
     maximum = getattr(signal, "maximum", None)
     if unit:
-        parts.append(f"Unit={unit}")
+        metadata["unit"] = unit
     if minimum is not None:
-        parts.append(f"Min={fmt_number(minimum)}")
+        metadata["min"] = str(minimum)
     if maximum is not None:
-        parts.append(f"Max={fmt_number(maximum)}")
+        metadata["max"] = str(maximum)
     if description:
-        parts.append(c_comment(description))
-    return "; ".join(parts)
+        try:
+            extra = json.loads(description)
+        except (ValueError, TypeError):
+            # Also accept legacy comments written as Python dictionaries.
+            try:
+                extra = ast.literal_eval(description)
+                json.dumps(extra, allow_nan=False)
+            except (ValueError, TypeError, SyntaxError):
+                extra = None
+        if isinstance(extra, dict) and all(isinstance(key, str) for key in extra):
+            metadata.update(extra)
+        else:
+            metadata["desc"] = description
+    if not metadata:
+        return ""
+    # JSON escapes embedded newlines, keeping the generated C comment on one line.
+    return json.dumps(metadata, ensure_ascii=False)
 
 
-def load_database(dbc_path: str):
+def skip_invalid_frame_ids(text: str, generation_warnings: list[str]) -> str:
+    """Drop unsupported CAN IDs and their signal definitions before parsing."""
+    skipped_ids = set()
+    lines = []
+    skip_signals = False
+    for line in text.splitlines(keepends=True):
+        match = re.match(r"^\s*BO_\s+(\d+)\s+(\w+)\s*:", line)
+        if match:
+            dbc_id = int(match[1])
+            # DBC uses bit 31 as the extended-frame flag, outside the CAN ID.
+            extended = bool(dbc_id & 0x80000000)
+            frame_id = dbc_id & ~0x80000000
+            limit = 29 if extended else 11
+            skip_signals = frame_id.bit_length() > limit
+            if skip_signals:
+                skipped_ids.add(dbc_id)
+                generation_warnings.append(
+                    f"Pominięto ramkę '{match[2]}': identyfikator CAN 0x{frame_id:X} "
+                    f"przekracza {limit} bitów."
+                )
+                continue
+        elif skip_signals:
+            if not line.strip() or re.match(r"^\s*SG_\s", line):
+                continue
+            skip_signals = False
+        lines.append(line)
+    # These entries must refer to a message present in cantools' database.
+    return "".join(
+        line for line in lines
+        if not (
+            (match := re.match(r"^\s*(?:VAL_|SIG_VALTYPE_)\s+(\d+)\s", line))
+            and int(match[1]) in skipped_ids
+        )
+    )
+
+
+def load_database(dbc_path: str, generation_warnings: list[str] | None = None):
     if cantools is None:
         raise GenerationError("Brak biblioteki cantools. Zainstaluj: python -m pip install cantools")
     try:
-        db = cantools.database.load_file(
-            dbc_path, encoding="utf-8", strict=True, prune_choices=False
+        notices = []
+        text = skip_invalid_frame_ids(Path(dbc_path).read_text(encoding="utf-8"), notices)
+        if generation_warnings is not None:
+            generation_warnings.extend(notices)
+        else:
+            for notice in notices:
+                warnings.warn(notice, stacklevel=2)
+        db = cantools.database.load_string(
+            text, database_format="dbc", strict=True, prune_choices=False
         )
     except Exception as exc:
         raise GenerationError(f"Nie udało się sparsować pliku DBC:\n{exc}") from exc
@@ -256,14 +331,23 @@ def prepare_model(db):
                     )
                 type_owners[enum_type] = f"enum:{enum_body!r}"
                 if enum_type not in enum_defs:
-                    # Allocate a unique prefix for each enum signal. All C enum
-                    # constants share one global namespace.
-                    base_prefix = enum_prefix(signal.name)
-                    prefix = base_prefix
-                    number = 2
-                    while any(existing.startswith(prefix) for existing in enum_label_owners):
-                        prefix = f"{base_prefix[:-1]}{number}_"
-                        number += 1
+                    # Preserve a shared DBC prefix if every candidate is free.
+                    # All C enum constants share one global namespace.
+                    first_label = choices[0][1]
+                    existing_prefix = first_label.partition("_")[0] + "_"
+                    has_prefix = (
+                        "_" in first_label
+                        and not first_label.startswith("_")
+                        and all(label.startswith(existing_prefix) for _, label in choices)
+                    )
+                    prefix = ""
+                    if not has_prefix or any(label in enum_label_owners for _, label in choices):
+                        base_prefix = enum_prefix(signal.name)
+                        prefix = base_prefix
+                        number = 2
+                        while any(prefix + label in enum_label_owners for _, label in choices):
+                            prefix = f"{base_prefix[:-1]}{number}_"
+                            number += 1
                     labels = []
                     for numeric_value, label in choices:
                         enum_label = prefix + label
@@ -439,8 +523,8 @@ def generate_source(model, header_filename: str) -> str:
     return "\n".join(lines)
 
 
-def generate_files(dbc_path: str):
-    db = load_database(dbc_path)
+def generate_files(dbc_path: str, generation_warnings: list[str] | None = None):
+    db = load_database(dbc_path, generation_warnings)
     model, enum_defs = prepare_model(db)
     header_name = Path(dbc_path).with_suffix(".h").name
     source_name = Path(dbc_path).with_suffix(".c").name
@@ -496,7 +580,8 @@ class DbcGeneratorApp:
             messagebox.showerror("Nie znaleziono pliku", f"Plik nie istnieje:\n{path}")
             return
         try:
-            header, source, header_name, source_name = generate_files(path)
+            generation_warnings = []
+            header, source, header_name, source_name = generate_files(path, generation_warnings)
         except GenerationError as exc:
             self.header_output.delete("1.0", tk.END)
             self.source_output.delete("1.0", tk.END)
@@ -516,6 +601,9 @@ class DbcGeneratorApp:
         self.source_output.delete("1.0", tk.END)
         self.source_output.insert("1.0", source)
         self.status.set(f"Gotowe: {header_name} oraz {source_name}")
+        if generation_warnings:
+            self.status.set(f"Gotowe: {header_name} oraz {source_name}. Pominięto ramek: {len(generation_warnings)}.")
+            messagebox.showwarning("Pominięte ramki", "\n".join(generation_warnings))
 
     def save_both(self):
         if not self.header_text or not self.source_text:
